@@ -1,9 +1,9 @@
 package slack
 
 import (
-	//	"github.com/gorilla/websocket"
 	"encoding/json"
-	"github.com/james-bowman/websocket"
+	"github.com/gorilla/websocket"
+	// "github.com/james-bowman/websocket"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -29,10 +29,12 @@ func handshake(apiUrl string, token string) (*Config, error) {
 	err = json.Unmarshal(body, &data)
 	if err != nil {
 		log.Printf("%T\n%s\n%#v\n", err, err, err)
+
 		switch v := err.(type) {
 		case *json.SyntaxError:
 			log.Println(string(body[v.Offset-40 : v.Offset]))
 		}
+
 		log.Printf("%s", body)
 		return nil, err
 	}
@@ -67,7 +69,12 @@ func Connect(token string) (*Connection, error) {
 		return nil, err
 	}
 
-	c := Connection{ws: conn, out: make(chan []byte, 256), in: make(chan []byte, 256), config: *config}
+	c := Connection{
+		ws:     conn,
+		out:    make(chan []byte, 256),
+		in:     make(chan []byte, 256),
+		config: *config,
+	}
 
 	c.start(func() (*Config, *websocket.Conn, error) {
 		config, con, err := connectAndUpgrade(apiStartUrl, token)

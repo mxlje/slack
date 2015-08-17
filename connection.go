@@ -1,11 +1,13 @@
 package slack
 
 import (
-	//	"github.com/gorilla/websocket"
-	"github.com/james-bowman/websocket"
+	// "github.com/james-bowman/websocket"
 	"log"
 	"sync"
 	"time"
+
+	// "github.com/davecgh/go-spew/spew"
+	"github.com/gorilla/websocket"
 )
 
 const (

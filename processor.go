@@ -3,45 +3,56 @@ package slack
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"regexp"
 	"strings"
+
+	log "github.com/Sirupsen/logrus"
+
+	// "github.com/davecgh/go-spew/spew"
 )
 
 const (
-	slackEventTypeMessage = "message"
+	eventTypeMessage    = "message"
+	eventTypeError      = "error"
+	eventTypeHello      = "hello"
+	eventTypeUserChange = "user_change"
 
 	maxMessageSize  = 4000
 	maxMessageLines = 25
 )
+
+type messageProcessor func(*Message)
+
+type slackEventHandler func(*Processor, map[string]interface{}, []byte)
+type slackEventHandlers map[string]slackEventHandler
 
 // Processor type processes inbound events from Slack
 type Processor struct {
 	// Connection to Slack
 	con *Connection
 
-	// Slack user information relating to the bot account
+	// Slack user information relating to the user account
 	self User
 
 	// a sequence number to uniquely identify sent messages and correlate with acks from Slack
 	sequence int
 
 	// map of event handler functions to handle types of Slack event
-	eventHandlers map[string]func(*Processor, map[string]interface{}, []byte)
+	eventHandlers slackEventHandlers
 
-	// map of users who are members of the Slack group
+	// map of users who are members of the Slack team
 	users map[string]User
 }
 
-// event type represents an event sent to Slack e.g. messages
+// event type represents an event sent TO Slack e.g. messages
 type event struct {
-	Id      int    `json:"id"`
+	ID      int    `json:"id"`
 	Type    string `json:"type"`
 	Channel string `json:"channel"`
 	Text    string `json:"text"`
 }
 
-// user_change event type represents a user change event from Slack
+// user_change event type represents a user change event FROM Slack
 type userChangeEvent struct {
 	Type        string `json:"type"`
 	UpdatedUser User   `json:"user"`
@@ -51,61 +62,30 @@ type userChangeEvent struct {
 func (p *Processor) sendEvent(eventType string, channel string, text string) error {
 	p.sequence++
 
-	response := &event{Id: p.sequence, Type: eventType, Channel: channel, Text: text}
+	response := &event{
+		ID:      p.sequence,
+		Type:    eventType,
+		Channel: channel,
+		Text:    text,
+	}
 
-	responseJson, err := json.Marshal(response)
+	responseJSON, err := json.Marshal(response)
 	if err != nil {
 		return err
 	}
 
-	p.con.Write(responseJson)
+	p.con.Write(responseJSON)
 
 	return nil
 }
 
-/*
-// Write the message on the specified channel to Slack
-func (p *Processor) Write(channel string, text string) error {
-	for len(text) > 0 {
-		if len(text) <= maxMessageSize {
-			if err := p.sendEvent(slackEventTypeMessage, channel, text); err != nil {
-				return err
-			}
-			text = ""
-		} else {
-			// split message at a convenient place
-			maxSizeChunk := text[:maxMessageSize]
-
-			var breakIndex int
-			if lastLineBreak := strings.LastIndex(maxSizeChunk, "\n"); lastLineBreak > -1 {
-				breakIndex = lastLineBreak
-			} else if lastWordBreak := strings.LastIndexAny(maxSizeChunk, "\n\t .,/\\-(){}[]|=+*&"); lastWordBreak > -1 {
-				breakIndex = lastWordBreak
-			} else {
-				breakIndex = maxMessageSize
-			}
-
-			if err := p.sendEvent(slackEventTypeMessage, channel, text[:breakIndex]); err != nil {
-				return err
-			}
-
-			if breakIndex != maxMessageSize {
-				breakIndex++
-			}
-
-			text = text[breakIndex:]
-		}
-	}
-
-	return nil
-}
-*/
-// Write the message on the specified channel to Slack
+// Write the message on the specified channel to Slack while respecting the maximum message
+// length, splitting up the message if necessary
 func (p *Processor) Write(channel string, text string) error {
 	for len(text) > 0 {
 		lines := strings.Count(text, "\n")
 		if len(text) <= maxMessageSize && lines <= maxMessageLines {
-			if err := p.sendEvent(slackEventTypeMessage, channel, text); err != nil {
+			if err := p.sendEvent(eventTypeMessage, channel, text); err != nil {
 				return err
 			}
 			text = ""
@@ -137,7 +117,7 @@ func (p *Processor) Write(channel string, text string) error {
 				breakIndex = maxMessageSize
 			}
 
-			if err := p.sendEvent(slackEventTypeMessage, channel, text[:breakIndex]); err != nil {
+			if err := p.sendEvent(eventTypeMessage, channel, text[:breakIndex]); err != nil {
 				return err
 			}
 
@@ -152,11 +132,12 @@ func (p *Processor) Write(channel string, text string) error {
 	return nil
 }
 
-// Start processing events from Slack
+// Start processing events from Slack. This is the main "event loop".
 func (p *Processor) Start() {
 	for {
 		msg := p.con.Read()
 
+		// log the raw message
 		log.Printf("%s", msg)
 
 		var data map[string]interface{}
@@ -194,33 +175,41 @@ func (p *Processor) Start() {
 // updateUser updates or adds (if not already existing) the specifed user
 func (p *Processor) updateUser(user User) {
 	p.users[user.Id] = user
+	// log.Println("[INFO] updated user", user.RealName, user.Id)
+	// log.Println(p.users)
 }
 
 // onConnected is a callback for when the client connects (or reconnects) to Slack.
 func (p *Processor) onConnected(con *Connection) {
 	p.self = con.config.Self
-	log.Printf("Connected to Slack as %s", p.self.Name)
+	log.Printf("Connected to Slack as %s (%s)", p.self.Name, p.self.Id)
 
-	p.users = make(map[string]User)
 	for _, user := range con.config.Users {
 		p.updateUser(user)
 	}
 }
 
-// type for callbacks to receive messages from Slack
-type messageProcessor func(*Message)
-
 // Starts processing events on the connection from Slack and passes any messages to the hear callback and only
 // messages addressed to the bot to the respond callback
 func EventProcessor(con *Connection, respond messageProcessor, hear messageProcessor) {
 	p := Processor{
-		con:  con,
-		self: con.config.Self,
-		eventHandlers: map[string]func(*Processor, map[string]interface{}, []byte){
-			slackEventTypeMessage: func(p *Processor, event map[string]interface{}, rawEvent []byte) {
-				filterMessage(p, event, respond, hear)
+		con:   con,
+		self:  con.config.Self,
+		users: make(map[string]User),
+
+		eventHandlers: slackEventHandlers{
+			eventTypeMessage: func(p *Processor, event map[string]interface{}, rawEvent []byte) {
+				// log.Println("MESSAGE", event["text"], p.users[event["user"].(string)].RealName)
+				// log.Println(string(rawEvent))
+				// log.Printf("%+v", ...).con.config.Users
+				// spew.Dump(p.users)
+				// spew.Dump(p.con.config.Users)
+				// filterMessage(p, event, respond, hear)
 			},
-			"user_change": func(p *Processor, event map[string]interface{}, rawEvent []byte) {
+
+			// The user_change event is sent to all connections for a team when a team
+			// member updates their profile or data. Clients can use this to update their local cache of team members.
+			eventTypeUserChange: func(p *Processor, event map[string]interface{}, rawEvent []byte) {
 				var userEvent userChangeEvent
 				err := json.Unmarshal(rawEvent, &userEvent)
 
@@ -234,14 +223,17 @@ func EventProcessor(con *Connection, respond messageProcessor, hear messageProce
 				}
 				p.updateUser(userEvent.UpdatedUser)
 			},
-			"hello": func(p *Processor, event map[string]interface{}, rawEvent []byte) {
+
+			// Initial message signaling a successful connection through the realtime API
+			eventTypeHello: func(p *Processor, event map[string]interface{}, rawEvent []byte) {
 				p.onConnected(con)
 			},
-			"error": func(p *Processor, event map[string]interface{}, rawEvent []byte) {
+
+			// A generic error from Slack
+			eventTypeError: func(p *Processor, event map[string]interface{}, rawEvent []byte) {
 				log.Printf("Error received from Slack: %s", rawEvent)
 			},
 		},
-		users: make(map[string]User),
 	}
 
 	p.Start()
