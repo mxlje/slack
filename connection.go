@@ -42,6 +42,11 @@ type Connection struct {
 	config Config
 }
 
+// currently automatically reconnects
+// func (c *Connection) Terminate() {
+// 	c.finish <- struct{}{}
+// }
+
 // write a message with the given message type and payload.
 func (c *Connection) write(mt int, payload []byte) error {
 	c.ws.SetWriteDeadline(time.Now().Add(writeWait))

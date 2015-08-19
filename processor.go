@@ -3,7 +3,7 @@ package slack
 import (
 	"encoding/json"
 	"fmt"
-	"regexp"
+	// "regexp"
 	"strings"
 
 	log "github.com/Sirupsen/logrus"
@@ -21,7 +21,8 @@ const (
 	maxMessageLines = 25
 )
 
-type messageProcessor func(*Message)
+// type messageProcessor func(*Message)
+type eventPipe chan []byte
 
 type slackEventHandler func(*Processor, map[string]interface{}, []byte)
 type slackEventHandlers map[string]slackEventHandler
@@ -42,6 +43,12 @@ type Processor struct {
 
 	// map of users who are members of the Slack team
 	users map[string]User
+
+	// two channels used for sending and receiving events
+	incoming, outgoing eventPipe
+
+	// signal to close the connection
+	// shutdown <-chan bool
 }
 
 // event type represents an event sent TO Slack e.g. messages
@@ -132,13 +139,13 @@ func (p *Processor) Write(channel string, text string) error {
 	return nil
 }
 
-// Start processing events from Slack. This is the main "event loop".
+// Start processing events from Slack. This is the main blocking loop
 func (p *Processor) Start() {
 	for {
 		msg := p.con.Read()
 
 		// log the raw message
-		log.Printf("%s", msg)
+		log.WithField("type", "raw").Printf("%s", msg)
 
 		var data map[string]interface{}
 		err := json.Unmarshal(msg, &data)
@@ -191,11 +198,18 @@ func (p *Processor) onConnected(con *Connection) {
 
 // Starts processing events on the connection from Slack and passes any messages to the hear callback and only
 // messages addressed to the bot to the respond callback
-func EventProcessor(con *Connection, respond messageProcessor, hear messageProcessor) {
+func EventProcessor(con *Connection) (eventPipe, eventPipe) {
+	var (
+		incoming = make(chan []byte) // Slack -> Server -> Client
+		outgoing = make(chan []byte) // Client -> Server -> Slack
+	)
+
 	p := Processor{
-		con:   con,
-		self:  con.config.Self,
-		users: make(map[string]User),
+		con:      con,
+		self:     con.config.Self,
+		users:    make(map[string]User),
+		incoming: incoming,
+		outgoing: outgoing,
 
 		eventHandlers: slackEventHandlers{
 			eventTypeMessage: func(p *Processor, event map[string]interface{}, rawEvent []byte) {
@@ -205,23 +219,32 @@ func EventProcessor(con *Connection, respond messageProcessor, hear messageProce
 				// spew.Dump(p.users)
 				// spew.Dump(p.con.config.Users)
 				// filterMessage(p, event, respond, hear)
+
+				// m, _ := newMessage(p, event)
+				// m.eventStream = p
+
+				// spew.Dump(m)
+
+				// for now we simply pipe the raw message to the main app as messages is
+				// all we care about
+				p.incoming <- rawEvent
 			},
 
 			// The user_change event is sent to all connections for a team when a team
 			// member updates their profile or data. Clients can use this to update their local cache of team members.
 			eventTypeUserChange: func(p *Processor, event map[string]interface{}, rawEvent []byte) {
-				var userEvent userChangeEvent
-				err := json.Unmarshal(rawEvent, &userEvent)
+				// var userEvent userChangeEvent
+				// err := json.Unmarshal(rawEvent, &userEvent)
 
-				if err != nil {
-					fmt.Printf("%T\n%s\n%#v\n", err, err, err)
-					switch v := err.(type) {
-					case *json.SyntaxError:
-						fmt.Println(string(rawEvent[v.Offset-40 : v.Offset]))
-					}
-					log.Printf("%s", rawEvent)
-				}
-				p.updateUser(userEvent.UpdatedUser)
+				// if err != nil {
+				// 	fmt.Printf("%T\n%s\n%#v\n", err, err, err)
+				// 	switch v := err.(type) {
+				// 	case *json.SyntaxError:
+				// 		fmt.Println(string(rawEvent[v.Offset-40 : v.Offset]))
+				// 	}
+				// 	log.Printf("%s", rawEvent)
+				// }
+				// p.updateUser(userEvent.UpdatedUser)
 			},
 
 			// Initial message signaling a successful connection through the realtime API
@@ -236,48 +259,49 @@ func EventProcessor(con *Connection, respond messageProcessor, hear messageProce
 		},
 	}
 
-	p.Start()
+	go p.Start()
+	return incoming, outgoing
 }
 
 // Invoke one of the specified callbacks for the message if appropriate
-func filterMessage(p *Processor, data map[string]interface{}, respond messageProcessor, hear messageProcessor) {
-	var userFullName string
-	var userId string
+// func filterMessage(p *Processor, data map[string]interface{}, respond messageProcessor, hear messageProcessor) {
+// 	var userFullName string
+// 	var userId string
 
-	user, ok := data["user"]
-	if ok {
-		userId = user.(string)
-		user, exists := p.users[userId]
-		if exists {
-			userFullName = user.RealName
-		}
-	}
+// 	user, ok := data["user"]
+// 	if ok {
+// 		userId = user.(string)
+// 		user, exists := p.users[userId]
+// 		if exists {
+// 			userFullName = user.RealName
+// 		}
+// 	}
 
-	// process messages directed at Talbot
-	r, _ := regexp.Compile("^(<@" + p.self.Id + ">|@?" + p.self.Name + "):? (.+)")
+// 	// process messages directed at Talbot
+// 	r, _ := regexp.Compile("^(<@" + p.self.Id + ">|@?" + p.self.Name + "):? (.+)")
 
-	text, ok := data["text"]
-	if !ok || text == nil {
-		return
-	}
+// 	text, ok := data["text"]
+// 	if !ok || text == nil {
+// 		return
+// 	}
 
-	matches := r.FindStringSubmatch(text.(string))
+// 	matches := r.FindStringSubmatch(text.(string))
 
-	if len(matches) == 3 {
-		if respond != nil {
-			m := &Message{eventStream: p, responseStrategy: reply, Text: matches[2], From: userFullName, fromId: userId, channel: data["channel"].(string)}
-			respond(m)
-		}
-	} else if data["channel"].(string)[0] == 'D' {
-		if respond != nil {
-			// process direct messages
-			m := &Message{eventStream: p, responseStrategy: send, Text: text.(string), From: userFullName, fromId: userId, channel: data["channel"].(string)}
-			respond(m)
-		}
-	} else {
-		if hear != nil {
-			m := &Message{eventStream: p, responseStrategy: send, Text: text.(string), From: userFullName, fromId: userId, channel: data["channel"].(string)}
-			hear(m)
-		}
-	}
-}
+// 	if len(matches) == 3 {
+// 		if respond != nil {
+// m := &Message{eventStream: p, responseStrategy: reply, Text: matches[2], From: userFullName, fromId: userId, channel: data["channel"].(string)}
+// 			respond(m)
+// 		}
+// 	} else if data["channel"].(string)[0] == 'D' {
+// 		if respond != nil {
+// 			// process direct messages
+// 			m := &Message{eventStream: p, responseStrategy: send, Text: text.(string), From: userFullName, fromId: userId, channel: data["channel"].(string)}
+// 			respond(m)
+// 		}
+// 	} else {
+// 		if hear != nil {
+// 			m := &Message{eventStream: p, responseStrategy: send, Text: text.(string), From: userFullName, fromId: userId, channel: data["channel"].(string)}
+// 			hear(m)
+// 		}
+// 	}
+// }
