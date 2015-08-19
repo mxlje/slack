@@ -39,7 +39,7 @@ type Connection struct {
 	in chan []byte
 
 	// information about the current Slack connection and team settings.
-	config Config
+	Config Config
 }
 
 // currently automatically reconnects
@@ -154,7 +154,7 @@ func (c *Connection) start(reconnectionHandler func() (*Config, *websocket.Conn,
 			}
 
 			c.ws = ws
-			c.config = *config
+			c.Config = *config
 		}
 	}()
 }

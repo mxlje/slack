@@ -73,7 +73,7 @@ func Connect(token string) (*Connection, error) {
 		ws:     conn,
 		out:    make(chan []byte, 256),
 		in:     make(chan []byte, 256),
-		config: *config,
+		Config: *config,
 	}
 
 	c.start(func() (*Config, *websocket.Conn, error) {

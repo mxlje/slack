@@ -21,7 +21,6 @@ const (
 	maxMessageLines = 25
 )
 
-// type messageProcessor func(*Message)
 type eventPipe chan []byte
 
 type slackEventHandler func(*Processor, map[string]interface{}, []byte)
@@ -33,7 +32,7 @@ type Processor struct {
 	con *Connection
 
 	// Slack user information relating to the user account
-	self User
+	// self User
 
 	// a sequence number to uniquely identify sent messages and correlate with acks from Slack
 	sequence int
@@ -49,6 +48,15 @@ type Processor struct {
 
 	// signal to close the connection
 	// shutdown <-chan bool
+
+	state *State
+}
+
+// A Gateway holds state and two channels for sending and receiving messages
+type Gateway struct {
+	Incoming eventPipe
+	Outgoing eventPipe
+	State    *State
 }
 
 // event type represents an event sent TO Slack e.g. messages
@@ -145,7 +153,7 @@ func (p *Processor) Start() {
 		msg := p.con.Read()
 
 		// log the raw message
-		log.WithField("type", "raw").Printf("%s", msg)
+		// log.WithField("type", "raw").Printf("%s", msg)
 
 		var data map[string]interface{}
 		err := json.Unmarshal(msg, &data)
@@ -181,33 +189,31 @@ func (p *Processor) Start() {
 
 // updateUser updates or adds (if not already existing) the specifed user
 func (p *Processor) updateUser(user User) {
-	p.users[user.Id] = user
+	p.state.Users[user.ID] = user
 	// log.Println("[INFO] updated user", user.RealName, user.Id)
 	// log.Println(p.users)
 }
 
 // onConnected is a callback for when the client connects (or reconnects) to Slack.
 func (p *Processor) onConnected(con *Connection) {
-	p.self = con.config.Self
-	log.Printf("Connected to Slack as %s (%s)", p.self.Name, p.self.Id)
+	log.Printf("Connected to Slack as %s (ID %s)", p.con.Config.Self.Name, p.con.Config.Self.ID)
 
-	for _, user := range con.config.Users {
+	for _, user := range con.Config.Users {
 		p.updateUser(user)
 	}
 }
 
 // Starts processing events on the connection from Slack and passes any messages to the hear callback and only
 // messages addressed to the bot to the respond callback
-func EventProcessor(con *Connection) (eventPipe, eventPipe) {
+func EventProcessor(con *Connection) *Gateway {
 	var (
 		incoming = make(chan []byte) // Slack -> Server -> Client
 		outgoing = make(chan []byte) // Client -> Server -> Slack
 	)
 
 	p := Processor{
-		con:      con,
-		self:     con.config.Self,
-		users:    make(map[string]User),
+		con: con,
+		// self:     con.Config.Self,
 		incoming: incoming,
 		outgoing: outgoing,
 
@@ -227,24 +233,27 @@ func EventProcessor(con *Connection) (eventPipe, eventPipe) {
 
 				// for now we simply pipe the raw message to the main app as messages is
 				// all we care about
-				p.incoming <- rawEvent
+				incoming <- rawEvent
 			},
 
 			// The user_change event is sent to all connections for a team when a team
 			// member updates their profile or data. Clients can use this to update their local cache of team members.
 			eventTypeUserChange: func(p *Processor, event map[string]interface{}, rawEvent []byte) {
-				// var userEvent userChangeEvent
-				// err := json.Unmarshal(rawEvent, &userEvent)
 
-				// if err != nil {
-				// 	fmt.Printf("%T\n%s\n%#v\n", err, err, err)
-				// 	switch v := err.(type) {
-				// 	case *json.SyntaxError:
-				// 		fmt.Println(string(rawEvent[v.Offset-40 : v.Offset]))
-				// 	}
-				// 	log.Printf("%s", rawEvent)
-				// }
-				// p.updateUser(userEvent.UpdatedUser)
+				var userEvent userChangeEvent
+				err := json.Unmarshal(rawEvent, &userEvent)
+
+				if err != nil {
+					fmt.Printf("%T\n%s\n%#v\n", err, err, err)
+					switch v := err.(type) {
+					case *json.SyntaxError:
+						fmt.Println(string(rawEvent[v.Offset-40 : v.Offset]))
+					}
+					log.Printf("%s", rawEvent)
+				}
+
+				log.Infoln("User info changed, ", userEvent.UpdatedUser.Name)
+				p.updateUser(userEvent.UpdatedUser)
 			},
 
 			// Initial message signaling a successful connection through the realtime API
@@ -259,8 +268,33 @@ func EventProcessor(con *Connection) (eventPipe, eventPipe) {
 		},
 	}
 
+	// Populate state with data from initial connection config
+	state := &State{
+		Self:  con.Config.Self,
+		Users: make(map[string]User),
+	}
+
+	// Users
+	for _, user := range con.Config.Users {
+		// p.updateUser(user)
+		state.Users[user.ID] = user
+	}
+
+	// Channels
+	state.Channels = con.Config.Channels
+
+	// Give state to processor so event handlers can access it
+	p.state = state
+
+	gateway := &Gateway{
+		Incoming: incoming,
+		Outgoing: outgoing,
+		State:    state,
+	}
+
 	go p.Start()
-	return incoming, outgoing
+
+	return gateway
 }
 
 // Invoke one of the specified callbacks for the message if appropriate
